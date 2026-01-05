@@ -1,6 +1,12 @@
 <template>
   <div class="push-box-mini">
-    <div class="game-grid">
+    <div v-if="!isStarted" class="start-overlay">
+      <p style="color: #2496ed;">[SYSTEM PAUSED]</p>
+      <p>ACCUMULATED LATENCY: {{ totalTime }}s</p>
+      <p class="blink">Press [SPACE] to Resume Deployment</p>
+    </div>
+
+    <div class="game-grid" :class="{ 'is-paused': !isStarted }">
       <div v-for="(row, r) in map" :key="r" class="game-row">
         <div 
           v-for="(cell, c) in row" 
@@ -11,9 +17,11 @@
         </div>
       </div>
     </div>
+
     <div class="mini-status">
-      <span>CPU: 12%</span>
-      <span>STEP: {{ history.length }}</span> <span v-if="isWin" style="color: #52c41a; font-weight: bold;">[COMPLETED]</span>
+      <span>TOTAL_LATENCY: {{ totalTime }}s</span>
+      <span>STEP: {{ history.length }}</span>
+      <span v-if="isWin" class="success-tag">[DEPLOY_SUCCESS]</span>
     </div>
   </div>
 </template>
@@ -26,52 +34,66 @@ const props = defineProps<{ levelData: CellType[][] }>();
 
 const map = ref<CellType[][]>([]);
 const isWin = ref(false);
-const history = ref<string[]>([]); // 存储地图快照的栈
+const isStarted = ref(false); 
+const history = ref<string[]>([]);
 
-// 初始化游戏
-const initGame = () => {
-  map.value = JSON.parse(JSON.stringify(props.levelData));
+// --- 计时器变量 ---
+const totalTime = ref(0); 
+let timer: number | null = null;
+
+// 1. 初始化/重置关卡逻辑
+const initLevel = () => {
+  stopTimer(); // 停止计时
+  map.value = JSON.parse(JSON.stringify(props.levelData)); // 还原地图
   isWin.value = false;
-  history.value = []; // 清空历史
+  isStarted.value = false; // 进入暂停/待机状态
+  history.value = [];
+  // 注意：这里不重置 totalTime.value，实现累计
 };
 
-// 监听关卡数据变化
-watch(() => props.levelData, initGame, { deep: true });
-
-// 记录历史（在每次有效移动前调用）
-const saveHistory = () => {
-  history.value.push(JSON.stringify(map.value));
+// 2. 计时器控制
+const startTimer = () => {
+  if (timer) return;
+  timer = window.setInterval(() => {
+    totalTime.value++;
+  }, 1000);
 };
 
-// 撤回功能 (Undo)
-const undo = () => {
-  if (history.value.length > 0) {
-    const lastState = history.value.pop();
-    if (lastState) {
-      map.value = JSON.parse(lastState);
-      isWin.value = false; // 撤回后肯定不是胜利状态
-    }
+const stopTimer = () => {
+  if (timer) {
+    clearInterval(timer);
+    timer = null;
   }
 };
 
+// 3. 监听关卡数据变化（只有换关卡才彻底重置时间）
+watch(() => props.levelData, () => {
+  totalTime.value = 0; 
+  initLevel();
+}, { deep: true, immediate: true });
+
+// 4. 移动逻辑
 const move = (dr: number, dc: number) => {
-  if (isWin.value) return;
+  if (isWin.value || !isStarted.value) return;
   
   let pr = -1, pc = -1;
   map.value.forEach((row, r) => row.forEach((cell, c) => { if(cell === 'P') { pr = r; pc = c; } }));
-  
+  if (pr === -1) return;
+
   const nr = pr + dr, nc = pc + dc;
   if (!map.value[nr] || !map.value[nr][nc] || map.value[nr][nc] === 'X') return;
 
+  const saveHistory = () => history.value.push(JSON.stringify(map.value));
+
   if (map.value[nr][nc] === 'B') {
     const nnr = nr + dr, nnc = nc + dc;
-    if (map.value[nnr][nnc] === '_' || map.value[nnr][nnc] === 'T') {
-      saveHistory(); // 移动箱子前保存状态
+    if (map.value[nnr] && (map.value[nnr][nnc] === '_' || map.value[nnr][nnc] === 'T')) {
+      saveHistory();
       map.value[nnr][nnc] = 'B';
       updateMove(pr, pc, nr, nc);
     }
   } else {
-    saveHistory(); // 仅移动人前保存状态
+    saveHistory();
     updateMove(pr, pc, nr, nc);
   }
   checkWin();
@@ -83,37 +105,53 @@ const updateMove = (or:number, oc:number, nr:number, nc:number) => {
 };
 
 const checkWin = () => {
-  isWin.value = props.levelData.every((row, r) => row.every((cell, c) => cell === 'T' ? map.value[r][c] === 'B' : true));
+  const win = props.levelData.every((row, r) => row.every((cell, c) => cell === 'T' ? map.value[r][c] === 'B' : true));
+  if (win) {
+    isWin.value = true;
+    stopTimer();
+    setTimeout(() => {
+      alert(`🎉 Mission Accomplished!\nTotal Time Spent: ${totalTime.value} seconds.`);
+    }, 100);
+  }
 };
 
-// 键盘监听
+// 5. 键盘监听
 const handleKey = (e: KeyboardEvent) => {
   const key = e.key.toLowerCase();
   
-  // 移动
-  if (key === 'w' || e.key === 'ArrowUp') move(-1, 0);
-  if (key === 's' || e.key === 'ArrowDown') move(1, 0);
-  if (key === 'a' || e.key === 'ArrowLeft') move(0, -1);
-  if (key === 'd' || e.key === 'ArrowRight') move(0, 1);
-  
-  // 撤回 (R)
-  if (key === 'r') {
-    undo();
-  }
-  
-  // 重置 (Space)
+  // 空格键逻辑
   if (e.code === 'Space') {
-    e.preventDefault(); // 防止空格导致页面滚动
-    initGame();
+    e.preventDefault();
+    if (!isStarted.value) {
+      isStarted.value = true;
+      startTimer(); // 继续计时
+    } else {
+      initLevel(); // 暂停计时并还原地图
+    }
+    return;
+  }
+
+  if (!isStarted.value) return; 
+
+  if (key === 'w' || key === 'arrowup') move(-1, 0);
+  if (key === 's' || key === 'arrowdown') move(1, 0);
+  if (key === 'a' || key === 'arrowleft') move(0, -1);
+  if (key === 'd' || key === 'arrowright') move(0, 1);
+  
+  if (key === 'r') {
+    if (history.value.length > 0) {
+      map.value = JSON.parse(history.value.pop()!);
+      isWin.value = false;
+    }
   }
 };
 
 onMounted(() => {
-  initGame();
   window.addEventListener('keydown', handleKey);
 });
 
 onUnmounted(() => {
+  stopTimer();
   window.removeEventListener('keydown', handleKey);
 });
 
@@ -122,16 +160,56 @@ const getCellClass = (r:number, c:number) => ({ 'is-wall': map.value[r][c] === '
 </script>
 
 <style scoped>
-/* 样式保持之前的紧凑版 */
-.push-box-mini { background: #1a1a1a; padding: 10px; border-radius: 4px; box-shadow: inset 0 0 10px #000; }
-.game-grid { border: 1px solid #333; display: inline-block; }
+.push-box-mini { 
+  background: #1a1a1a; 
+  padding: 10px; 
+  border-radius: 4px; 
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.start-overlay {
+  position: absolute;
+  top: 0; left: 0; right: 0; bottom: 35px;
+  background: rgba(0,0,0,0.9);
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  color: #ccc;
+  font-family: monospace;
+  font-size: 11px;
+}
+
+.blink { animation: blinker 1.5s linear infinite; margin-top: 10px; color: #666; }
+@keyframes blinker { 50% { opacity: 0; } }
+
+.game-grid { border: 1px solid #333; display: inline-block; transition: opacity 0.3s; }
+.is-paused { opacity: 0.2; }
+
 .game-row { display: flex; }
 .game-cell { 
-  width: 22px; height: 22px; /* 进一步缩小一点 */
+  width: 22px; height: 22px; 
   display: flex; align-items: center; justify-content: center; 
   font-size: 12px; color: #888; border: 0.1px solid #222;
 }
+
 .is-wall { background: #333; }
 .is-t { background: #2a2020; }
-.mini-status { margin-top: 8px; font-family: 'Courier New', Courier, monospace; font-size: 9px; color: #555; display: flex; gap: 12px; }
+
+.mini-status { 
+  margin-top: 8px; 
+  font-family: 'Courier New', Courier, monospace; 
+  font-size: 9px; 
+  color: #555; 
+  display: flex; 
+  gap: 12px; 
+  width: 100%;
+  justify-content: center;
+}
+
+.success-tag { color: #52c41a; font-weight: bold; }
 </style>
