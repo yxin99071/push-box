@@ -8,11 +8,7 @@
 
     <div class="game-grid" :class="{ 'is-paused': !isStarted }">
       <div v-for="(row, r) in map" :key="r" class="game-row">
-        <div 
-          v-for="(cell, c) in row" 
-          :key="c" 
-          :class="['game-cell', getCellClass(r, c)]"
-        >
+        <div v-for="(cell, c) in row" :key="c" :class="['game-cell', getCellClass(r, c)]">
           {{ getEmoji(cell) }}
         </div>
       </div>
@@ -28,117 +24,147 @@
 
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, watch } from 'vue';
+import { DockerApi } from '../services/api';
 
-type CellType = 'X' | 'P' | 'B' | 'T' | '_';
-const props = defineProps<{ levelData: CellType[][] }>();
+type CellType = 'X' | 'P' | 'B' | 'T' | '_' | 'F' | 'M';
+
+const props = defineProps<{
+  levelData: CellType[][],
+  levelId: number,
+  currentUser: { dockerId: string, name: string }
+}>();
+
+const emit = defineEmits(['refreshRank']);
 
 const map = ref<CellType[][]>([]);
 const isWin = ref(false);
-const isStarted = ref(false); 
+const isStarted = ref(false);
 const history = ref<string[]>([]);
-
-// --- 计时器变量 ---
-const totalTime = ref(0); 
+const totalTime = ref(0);
 let timer: number | null = null;
 
-// 1. 初始化/重置关卡逻辑
+// 1. 初始化
 const initLevel = () => {
-  stopTimer(); // 停止计时
-  map.value = JSON.parse(JSON.stringify(props.levelData)); // 还原地图
+  stopTimer();
+  map.value = JSON.parse(JSON.stringify(props.levelData));
   isWin.value = false;
-  isStarted.value = false; // 进入暂停/待机状态
+  isStarted.value = false;
   history.value = [];
-  // 注意：这里不重置 totalTime.value，实现累计
+  // 【关键修改】：这里不再执行 totalTime.value = 0
+  // 只有当 props.levelData 改变（换关卡）时，才在 watch 里重置时间
 };
 
-// 2. 计时器控制
+// 2. 计时器
 const startTimer = () => {
   if (timer) return;
-  timer = window.setInterval(() => {
-    totalTime.value++;
-  }, 1000);
+  timer = window.setInterval(() => { totalTime.value++; }, 1000);
 };
 
 const stopTimer = () => {
-  if (timer) {
-    clearInterval(timer);
-    timer = null;
-  }
+  if (timer) { clearInterval(timer); timer = null; }
 };
 
-// 3. 监听关卡数据变化（只有换关卡才彻底重置时间）
-watch(() => props.levelData, () => {
-  totalTime.value = 0; 
+watch(() => props.levelId, () => {
+  // 当关卡 ID 变了，说明是新任务，重置累计时间
+  totalTime.value = 0;
   initLevel();
-}, { deep: true, immediate: true });
+}, { immediate: true });
 
-// 4. 移动逻辑
+// 3. 核心移动逻辑 (已集成 M 状态)
 const move = (dr: number, dc: number) => {
   if (isWin.value || !isStarted.value) return;
-  
+
   let pr = -1, pc = -1;
-  map.value.forEach((row, r) => row.forEach((cell, c) => { if(cell === 'P') { pr = r; pc = c; } }));
+  map.value.forEach((row, r) => row.forEach((cell, c) => { 
+    if (cell === 'P' || cell === 'M') { pr = r; pc = c; } 
+  }));
   if (pr === -1) return;
 
   const nr = pr + dr, nc = pc + dc;
-  if (!map.value[nr] || !map.value[nr][nc] || map.value[nr][nc] === 'X') return;
+  const targetCell = map.value[nr]?.[nc];
+
+  if (!targetCell || targetCell === 'X') return;
 
   const saveHistory = () => history.value.push(JSON.stringify(map.value));
 
-  if (map.value[nr][nc] === 'B') {
+  // A. 推箱子 (B 或 F)
+  if (targetCell === 'B' || targetCell === 'F') {
     const nnr = nr + dr, nnc = nc + dc;
-    if (map.value[nnr] && (map.value[nnr][nnc] === '_' || map.value[nnr][nnc] === 'T')) {
+    const nextNextCell = map.value[nnr]?.[nnc];
+
+    if (nextNextCell === '_' || nextNextCell === 'T') {
       saveHistory();
-      map.value[nnr][nnc] = 'B';
-      updateMove(pr, pc, nr, nc);
+      // 箱子位移
+      map.value[nnr][nnc] = (nextNextCell === 'T') ? 'F' : 'B';
+      // 玩家进入：原处是 F 则新位置是 M
+      map.value[nr][nc] = (targetCell === 'F') ? 'M' : 'P';
+      // 玩家离开：原处是 M 则还原 T
+      map.value[pr][pc] = (map.value[pr][pc] === 'M') ? 'T' : '_';
+      
+      handlePostMove();
     }
-  } else {
+  } 
+  // B. 走空地 ( _ 或 T)
+  else if (targetCell === '_' || targetCell === 'T') {
     saveHistory();
-    updateMove(pr, pc, nr, nc);
+    map.value[nr][nc] = (targetCell === 'T') ? 'M' : 'P';
+    map.value[pr][pc] = (map.value[pr][pc] === 'M') ? 'T' : '_';
+    
+    handlePostMove();
   }
-  checkWin();
 };
 
-const updateMove = (or:number, oc:number, nr:number, nc:number) => {
-  map.value[or][oc] = props.levelData[or][oc] === 'T' ? 'T' : '_';
-  map.value[nr][nc] = 'P';
-};
+// 4. 移动后的处理：判定+提交
+const handlePostMove = async () => {
+  const win = !map.value.some(row => row.includes('T') || row.includes('M'));
 
-const checkWin = () => {
-  const win = props.levelData.every((row, r) => row.every((cell, c) => cell === 'T' ? map.value[r][c] === 'B' : true));
-  if (win) {
+  if (win && !isWin.value) {
     isWin.value = true;
     stopTimer();
-    setTimeout(() => {
-      alert(`🎉 Mission Accomplished!\nTotal Time Spent: ${totalTime.value} seconds.`);
-    }, 100);
+    const finalSteps = history.value.length;
+    const finalTime = totalTime.value; // 此时是累计后的总时间
+    totalTime.value = 0;
+    try {
+      await DockerApi.pushMetrics({
+        dockerId: props.currentUser.dockerId,
+        levelId: props.levelId,
+        latency: finalTime * 10,
+        operations: finalSteps
+      });
+
+      emit('refreshRank');
+      
+      setTimeout(() => {
+        alert(`🎉 DEPLOYMENT SUCCESS!\n\nTotal Accumulated Time: ${finalTime}s\nSteps: ${finalSteps}`);
+        // 成功后，如果用户选择留在本页，可以考虑重置时间以便下一次挑战
+        // totalTime.value = 0; 
+      }, 300);
+    } catch (e) {
+      console.error("Telemetry Sync Error:", e);
+    }
   }
 };
-
-// 5. 键盘监听
+// 5. 键盘交互
 const handleKey = (e: KeyboardEvent) => {
   const key = e.key.toLowerCase();
-  
-  // 空格键逻辑
   if (e.code === 'Space') {
     e.preventDefault();
-    if (!isStarted.value) {
-      isStarted.value = true;
-      startTimer(); // 继续计时
-    } else {
-      initLevel(); // 暂停计时并还原地图
-    }
+    if (!isStarted.value) { isStarted.value = true; startTimer(); } 
+    else { initLevel(); }
     return;
   }
+  if (!isStarted.value) return;
 
-  if (!isStarted.value) return; 
+  const directionMap: Record<string, [number, number]> = {
+    'w': [-1, 0], 'arrowup': [-1, 0],
+    's': [1, 0], 'arrowdown': [1, 0],
+    'a': [0, -1], 'arrowleft': [0, -1],
+    'd': [0, 1], 'arrowright': [0, 1]
+  };
 
-  if (key === 'w' || key === 'arrowup') move(-1, 0);
-  if (key === 's' || key === 'arrowdown') move(1, 0);
-  if (key === 'a' || key === 'arrowleft') move(0, -1);
-  if (key === 'd' || key === 'arrowright') move(0, 1);
-  
-  if (key === 'r') {
+  if (directionMap[key]) {
+    move(...directionMap[key]);
+  } else if (key === 'r') {
     if (history.value.length > 0) {
       map.value = JSON.parse(history.value.pop()!);
       isWin.value = false;
@@ -146,34 +172,45 @@ const handleKey = (e: KeyboardEvent) => {
   }
 };
 
-onMounted(() => {
-  window.addEventListener('keydown', handleKey);
-});
+onMounted(() => window.addEventListener('keydown', handleKey));
+onUnmounted(() => { stopTimer(); window.removeEventListener('keydown', handleKey); });
 
-onUnmounted(() => {
-  stopTimer();
-  window.removeEventListener('keydown', handleKey);
-});
+const getEmoji = (c: CellType) => ({ 
+  'P': '●', 'B': '▣', 'F': '✅', 'X': '■', 'T': '○', '_': '', 'M': '◎' 
+}[c]);
 
-const getEmoji = (c: CellType) => ({ 'P': '●', 'B': '▣', 'X': '■', 'T': '○', '_': '' }[c]);
-const getCellClass = (r:number, c:number) => ({ 'is-wall': map.value[r][c] === 'X', 'is-t': props.levelData[r][c] === 'T' });
+const getCellClass = (r: number, c: number) => {
+  const cell = map.value[r][c];
+  return {
+    'is-wall': cell === 'X',
+    'is-t': props.levelData[r][c] === 'T' || cell === 'M', // 目标点底色保持
+    'is-f': cell === 'F'
+  };
+};
 </script>
 
 <style scoped>
-.push-box-mini { 
-  background: #1a1a1a; 
-  padding: 10px; 
-  border-radius: 4px; 
+.push-box-mini {
+  background: #1a1a1a;
+  padding: 10px;
+  border-radius: 4px;
   position: relative;
   display: flex;
   flex-direction: column;
   align-items: center;
 }
-
+.is-f {
+  background: #1d3524 !important; /* 暗绿色背景 */
+  color: #52c41a !important;      /* 亮绿色图标 */
+  text-shadow: 0 0 5px #52c41a;
+}
 .start-overlay {
   position: absolute;
-  top: 0; left: 0; right: 0; bottom: 35px;
-  background: rgba(0,0,0,0.9);
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 35px;
+  background: rgba(0, 0, 0, 0.9);
   z-index: 10;
   display: flex;
   flex-direction: column;
@@ -184,32 +221,64 @@ const getCellClass = (r:number, c:number) => ({ 'is-wall': map.value[r][c] === '
   font-size: 11px;
 }
 
-.blink { animation: blinker 1.5s linear infinite; margin-top: 10px; color: #666; }
-@keyframes blinker { 50% { opacity: 0; } }
-
-.game-grid { border: 1px solid #333; display: inline-block; transition: opacity 0.3s; }
-.is-paused { opacity: 0.2; }
-
-.game-row { display: flex; }
-.game-cell { 
-  width: 22px; height: 22px; 
-  display: flex; align-items: center; justify-content: center; 
-  font-size: 12px; color: #888; border: 0.1px solid #222;
+.blink {
+  animation: blinker 1.5s linear infinite;
+  margin-top: 10px;
+  color: #666;
 }
 
-.is-wall { background: #333; }
-.is-t { background: #2a2020; }
+@keyframes blinker {
+  50% {
+    opacity: 0;
+  }
+}
 
-.mini-status { 
-  margin-top: 8px; 
-  font-family: 'Courier New', Courier, monospace; 
-  font-size: 9px; 
-  color: #555; 
-  display: flex; 
-  gap: 12px; 
+.game-grid {
+  border: 1px solid #333;
+  display: inline-block;
+  transition: opacity 0.3s;
+}
+
+.is-paused {
+  opacity: 0.2;
+}
+
+.game-row {
+  display: flex;
+}
+
+.game-cell {
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  color: #888;
+  border: 0.1px solid #222;
+}
+
+.is-wall {
+  background: #333;
+}
+
+.is-t {
+  background: #2a2020;
+}
+
+.mini-status {
+  margin-top: 8px;
+  font-family: 'Courier New', Courier, monospace;
+  font-size: 9px;
+  color: #555;
+  display: flex;
+  gap: 12px;
   width: 100%;
   justify-content: center;
 }
 
-.success-tag { color: #52c41a; font-weight: bold; }
+.success-tag {
+  color: #52c41a;
+  font-weight: bold;
+}
 </style>
